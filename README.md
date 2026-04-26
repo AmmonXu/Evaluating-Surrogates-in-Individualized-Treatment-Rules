@@ -1,4 +1,4 @@
-<img width="522" height="660" alt="image" src="https://github.com/user-attachments/assets/2c1cf84d-d8b6-4855-a476-339218cdf69c" /># Evaluating-Surrogates-in-Individualized-Treatment-Rules
+# Evaluating-Surrogates-in-Individualized-Treatment-Rules
 
 Reproducible code for simulation and application in the article "Evaluating Surrogates in Individualized Treatment Rules".
 
