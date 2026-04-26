@@ -7,7 +7,7 @@ Reproducible code for simulation and application in the article "Evaluating Surr
 * `criteo-uplift-v2.1.csv`: this dataset contains the Criteo uplift data used in the application.
   * The dataset is available at this link: [https://ailab.criteo.com/criteo-uplift-prediction-dataset/](https://ailab.criteo.com/criteo-uplift-prediction-dataset/).
 
-* Application code is organized within the `Application` directory, categorized by different machine learning models (`boosting`, `kernelr`, `lightGBM`, `rbf`, `xgboost`).
+* Application code is organized within the `Application` directory, categorized by different machine learning models (`boosting`, `lightGBM`, `random_forest`, `xgboost`).
   * Inside each model's folder, there are specific scripts for different outcomes (e.g., `xgb_exposure.py` and `xgb_visit.py`).
   * **Note:** To reproduce all the results presented in the application under different budget constraints, you need to manually modify the `lambda_val` parameter within these scripts to correspond to the specific budget.
 
