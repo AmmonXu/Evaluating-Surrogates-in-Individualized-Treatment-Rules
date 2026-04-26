@@ -1,0 +1,1276 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import RandomForestClassifier
+
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.svm import SVR
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import train_test_split
+from sklearn.kernel_ridge import KernelRidge
+from scipy import stats
+import seaborn as sns
+import xgboost as xgb
+from xgboost import XGBClassifier
+
+# Set random seed to ensure reproducibility
+np.random.seed(42)
+
+def lambda_val_f():
+    return 1
+
+def compute_tau_Y(X):
+    # return -1 + 1.5 * X[:, 0] + 0.6 * X[:, 1]
+    return 0.3 * (X[:, 0] ** 2 + X[:, 1] ** 2) + 1.8 * X[:, 0] + 0.6 * X[:, 1]
+
+def compute_tau_S(X):
+    # return -0.5 + 1.2 * X[:, 0] + 0.3 * X[:, 1]
+    return 0.3 * (X[:, 0] ** 2 + X[:, 1] ** 2) + 1.6 * X[:, 0] + 0.3 * X[:, 1]
+
+def compute_base_mean(X):
+    return 1.0 + 0.3 * X[:, 0] + 0.2 * X[:, 1]
+
+def compute_base_mean_s(X):
+    return 0.5 + 0.2 * X[:, 0] + 0.1 * X[:, 1]
+
+def generate_epsilon(n_samples):
+    return np.random.normal(0, 1, size=n_samples)
+
+def propensity_score_f(X):
+    # print(1 / (1 + np.exp(-(0.3 * X[:, 0] + 0.2 * X[:, 1]))))
+    return 1 / (1 + np.exp(-(0.1 * X[:, 0] + 0.1 * X[:, 1])))
+
+def generate_X(n_samples):
+    # return np.random.binomial(1, 0.3, size=(n_samples, 2))
+    return np.random.normal(0, 1, size=(n_samples, 2))
+    # return np.random.uniform(-2, 2, (n_samples, 2))
+
+def generate_SY(n_samples, X):
+    # === Potential outcomes for Y ===
+    # Y(1): Potential outcome for the treatment group
+    logit_y1 = 0.1 * X[:, 0] + 0.1 * X[:, 1] + 0.2
+    prob_y1 = 1 / (1 + np.exp(-logit_y1))
+    Y1 = np.random.binomial(1, prob_y1, size=n_samples)
+
+    # Y(0): Potential outcome for the control group
+    logit_y0 = 0.2 * X[:, 0] ** 2 + 0.2 * X[:, 1] + 0.1
+    prob_y0 = 1 / (1 + np.exp(-logit_y0))
+    Y0 = np.random.binomial(1, prob_y0, size=n_samples)
+
+    # === Potential outcomes for S ===
+    # S(1): Surrogate outcome for the treatment group
+    logit_s1 = 0.3 * X[:, 0] + 0.2 * X[:, 1] + 0.2
+    prob_s1 = 1 / (1 + np.exp(-logit_s1))
+    S1 = np.random.binomial(1, prob_s1, size=n_samples)
+
+    # S(0): Surrogate outcome for the control group
+    logit_s0 = 0.2 * X[:, 0] ** 2 + 0.1 * X[:, 1] + 0.1
+    prob_s0 = 1 / (1 + np.exp(-logit_s0))
+    S0 = np.random.binomial(1, prob_s0, size=n_samples)
+    return prob_y1, prob_y0, prob_s1, prob_s0, Y1, Y0, S1, S0
+
+# Function to generate data
+def generate_data(n_samples=10000, seed=None):
+    if seed is not None:
+        np.random.seed(seed)
+
+    # Generate covariates X using normal distribution (dimension 2)
+    X = generate_X(n_samples)
+
+    # Set propensity score e(X) = P(A=1|X)
+    # Use sigmoid function to ensure overlap condition is met
+    propensity_score = propensity_score_f(X)
+    propensity_score = np.clip(propensity_score, 0.3, 0.7)  # Avoid extreme values
+
+    # Generate treatment variable A ~ Bernoulli(e(X))
+    A = np.random.binomial(1, propensity_score, size=n_samples)
+
+    # Simple linear form: tau(X) = X * beta
+    # Use different coefficients for tau_Y and tau_S
+    # tau_Y_true = (X[:, 0] ** 2 + X[:, 1] ** 2) + 1.8 * X[:, 0] + 1.5 * X[:, 1]
+    # tau_S_true = (X[:, 0] ** 2 + X[:, 1] ** 2) + 0.6 * X[:, 0] - 0.3 * X[:, 1]
+
+    # Generate potential outcomes, ensuring Y(1) - Y(0) = tau_Y_true
+    mu_1_true, mu_0_true, smu_1, smu_0, Y_1, Y_0, S_1, S_0 = generate_SY(n_samples, X)
+
+    tau_Y_true = mu_1_true - mu_0_true
+    tau_S_true = smu_1 - smu_0
+
+    # Generate observed outcomes Y = A*Y(1) + (1-A)*Y(0)
+    Y = A * Y_1 + (1 - A) * Y_0
+    # Generate observed surrogate outcomes S = A*S(1) + (1-A)*S(0)
+    S = A * S_1 + (1 - A) * S_0
+
+    # Generate true decision rules
+    pi_Y_true, pi_S_true = estimate_decision_rules(tau_Y_true, tau_S_true, lambda_val = lambda_val_f())
+
+    # True μ_A(X) = A*μ_1(X) + (1-A)*μ_0(X)
+    mu_A_true = A * mu_1_true + (1 - A) * mu_0_true
+
+    return {
+        'X': X,
+        'A': A,
+        'Y': Y,
+        'S': S,
+        'Y_1': Y_1,  # Potential outcomes
+        'Y_0': Y_0,  # Potential outcomes
+        'S_1': S_1,  # Potential surrogate outcomes
+        'S_0': S_0,  # Potential surrogate outcomes
+        'propensity_score': propensity_score,  # e(X)
+        'tau_Y_true': tau_Y_true,  # tau_Y(X)
+        'tau_S_true': tau_S_true,  # tau_S(X)
+        'pi_Y_true': pi_Y_true,  # π_Y(X)
+        'pi_S_true': pi_S_true,  # π_S(X)
+        'mu_1_true': mu_1_true,  # μ_1(X)
+        'mu_0_true': mu_0_true,  # μ_0(X)
+        'mu_A_true': mu_A_true,  # μ_A(X)
+    }
+
+
+# Estimate propensity score e(X) = P(A=1|X)
+def estimate_propensity_score(X, A):
+    model = LogisticRegression(max_iter=1000)
+    model = LogisticRegression(
+        max_iter=2000,  # Increase number of iterations
+        solver='lbfgs',  # Switch to a more stable solver
+        C=1e10,  # Reduce regularization (close to no regularization)
+        fit_intercept=True,  # Ensure fitting intercept
+        random_state=42  # Fix random seed
+    )
+    model.fit(X, A)
+    return model
+
+
+# Estimate conditional expectation μ_a(X) = E[Y|A=a,X]
+def estimate_conditional_expectation(X, A, Y):
+    from sklearn.linear_model import LinearRegression
+
+    # Estimate μ_1(X) and μ_0(X) separately
+    X_treated = X[A == 1]
+    Y_treated = Y[A == 1]
+    X_control = X[A == 0]
+    Y_control = Y[A == 0]
+
+    # model_1 = RandomForestRegressor(
+    #     n_estimators=200,          # Moderately increase the number of trees
+    #     max_depth=10,              # Deep enough to capture linear relationships
+    #     min_samples_split=5,       # Slightly increase to reduce overfitting
+    #     min_samples_leaf=2,        # Slightly increase to reduce overfitting
+    #     max_features=0.8,          # Consider more features (80% of total features)
+    #     bootstrap=True,            # Keep default bootstrap sampling
+    #     random_state=42)
+    # model_1 = LinearRegression()
+    # model_0 = LinearRegression()
+    model_1 = KernelRidge(
+        alpha=0.8,  # Regularization parameter
+        kernel='polynomial',  # Use polynomial kernel
+        degree=2,  # Polynomial degree
+        coef0=1,  # Constant term
+        gamma=None  # Kernel coefficient, None means 1/n_features
+    )
+    model_0 = KernelRidge(
+        alpha=0.8,  # Regularization parameter
+        kernel='polynomial',  # Use polynomial kernel
+        degree=2,  # Polynomial degree
+        coef0=1,  # Constant term
+        gamma=None  # Kernel coefficient, None means 1/n_features
+    )
+    model_1 = LogisticRegression(
+        max_iter=2000,  # Increase number of iterations
+        solver='lbfgs',  # Switch to a more stable solver
+        C=1e10,  # Reduce regularization (close to no regularization)
+        fit_intercept=True,  # Ensure fitting intercept
+        random_state=42  # Fix random seed
+    )
+    model_0 = LogisticRegression(
+        max_iter=2000,  # Increase number of iterations
+        solver='lbfgs',  # Switch to a more stable solver
+        C=1e10,  # Reduce regularization (close to no regularization)
+        fit_intercept=True,  # Ensure fitting intercept
+        random_state=42  # Fix random seed
+    )
+    model_1 = XGBClassifier(
+        n_estimators=500,
+        max_depth=3,
+        learning_rate=0.05,
+        min_child_weight=2,
+        subsample=0.7,
+        colsample_bytree=0.8,
+        gamma=0.1,
+        reg_alpha=0,
+        reg_lambda=1,
+        random_state=42,
+        eval_metric='logloss'
+    )
+
+    model_0 = XGBClassifier(
+        n_estimators=500,
+        max_depth=3,
+        learning_rate=0.05,
+        min_child_weight=2,
+        subsample=0.7,
+        colsample_bytree=0.8,
+        gamma=0.1,
+        reg_alpha=0,
+        reg_lambda=1,
+        random_state=42,
+        eval_metric='logloss'
+    )
+    # model_1 = RandomForestRegressor(
+    #     n_estimators=150,
+    #     max_depth=10,
+    #     min_samples_split=20,
+    #     min_samples_leaf=10,
+    #     random_state=42
+    # )
+    # model_0 = RandomForestRegressor(
+    #     n_estimators=150,
+    #     max_depth=10,
+    #     min_samples_split=20,
+    #     min_samples_leaf=10,
+    #     random_state=42
+    # )
+
+    if len(X_treated) > 0:
+        model_1.fit(X_treated, Y_treated)
+    if len(X_control) > 0:
+        model_0.fit(X_control, Y_control)
+
+    return model_1, model_0
+
+
+# Estimate CATE tau_Y(X)
+def estimate_tau_Y(X_train, A_train, Y_train):
+    # Use S-learner method to estimate CATE
+    # Use treatment variable as one of the features
+    from sklearn.linear_model import LinearRegression
+
+    X_treated = X_train[A_train == 1]
+    Y_treated = Y_train[A_train == 1]
+    X_control = X_train[A_train == 0]
+    Y_control = Y_train[A_train == 0]
+
+    model_1 = LogisticRegression(
+        max_iter=2000,  # Increase number of iterations
+        solver='lbfgs',  # Switch to a more stable solver
+        C=1e10,  # Reduce regularization (close to no regularization)
+        fit_intercept=True,  # Ensure fitting intercept
+        random_state=42  # Fix random seed
+    )
+    model_0 = LogisticRegression(
+        max_iter=2000,  # Increase number of iterations
+        solver='lbfgs',  # Switch to a more stable solver
+        C=1e10,  # Reduce regularization (close to no regularization)
+        fit_intercept=True,  # Ensure fitting intercept
+        random_state=42  # Fix random seed
+    )
+    model_1 = XGBClassifier(
+        n_estimators=500,
+        max_depth=3,
+        learning_rate=0.05,
+        min_child_weight=2,
+        subsample=0.7,
+        colsample_bytree=0.8,
+        gamma=0.1,
+        reg_alpha=0,
+        reg_lambda=1,
+        random_state=42,
+        eval_metric='logloss'
+    )
+    model_0 = XGBClassifier(
+        n_estimators=500,
+        max_depth=3,
+        learning_rate=0.05,
+        min_child_weight=2,
+        subsample=0.7,
+        colsample_bytree=0.8,
+        gamma=0.1,
+        reg_alpha=0,
+        reg_lambda=1,
+        random_state=42,
+        eval_metric='logloss'
+    )
+    # model_1 = RandomForestRegressor(
+    #     n_estimators=100,
+    #     max_depth=12,
+    #     min_samples_split=20,
+    #     min_samples_leaf=5,
+    #     random_state=42
+    # )
+    # model_0 = RandomForestRegressor(
+    #     n_estimators=100,
+    #     max_depth=12,
+    #     min_samples_split=20,
+    #     min_samples_leaf=5,
+    #     random_state=42
+    # )
+
+    if len(X_treated) > 0:
+        model_1.fit(X_treated, Y_treated)
+    if len(X_control) > 0:
+        model_0.fit(X_control, Y_control)
+    Y_hat_1 = model_1.predict_proba(X_train)[:, 1]
+    Y_hat_0 = model_0.predict_proba(X_train)[:, 1]
+    # model = LinearRegression()
+    # model = SVR(
+    #     kernel='linear',  # Use linear kernel
+    #     C=1.0,  # Regularization parameter
+    #     epsilon=0.1,  # epsilon bandwidth
+    #     tol=1e-3,  # Convergence tolerance
+    #     max_iter=-1  # Maximum number of iterations, -1 means unlimited
+    # )
+    # model = KernelRidge(
+    #     alpha=0.8,  # Regularization parameter
+    #     kernel='polynomial',  # Use polynomial kernel
+    #     degree=3,  # Polynomial degree
+    #     coef0=1,  # Constant term
+    #     gamma=None  # Kernel coefficient, None means 1/n_features
+    # )
+    model = RandomForestRegressor(
+        n_estimators=100,
+        max_depth=12,
+        min_samples_split=20,
+        min_samples_leaf=5,
+        random_state=42
+    )
+    model = LogisticRegression(
+        max_iter=2000,  # Increase number of iterations
+        solver='lbfgs',  # Switch to a more stable solver
+        C=1e10,  # Reduce regularization (close to no regularization)
+        fit_intercept=True,  # Ensure fitting intercept
+        random_state=42  # Fix random seed
+    )
+    X_with_A = np.column_stack((X_train, A_train))
+    model.fit(X_with_A, Y_train)
+    return model_1, model_0, Y_hat_1 - Y_hat_0
+
+# Estimate CATE tau_S(X)
+def estimate_tau_S(X_train, A_train, S_train):
+    # Similar to estimating tau_Y, but using S as the outcome variable
+    from sklearn.linear_model import LinearRegression
+
+    X_treated = X_train[A_train == 1]
+    S_treated = S_train[A_train == 1]
+    X_control = X_train[A_train == 0]
+    S_control = S_train[A_train == 0]
+
+    model_1 = RandomForestRegressor(
+        n_estimators=100,
+        max_depth=12,
+        min_samples_split=20,
+        min_samples_leaf=5,
+        random_state=42
+    )
+    model_0 = RandomForestRegressor(
+        n_estimators=100,
+        max_depth=12,
+        min_samples_split=20,
+        min_samples_leaf=5,
+        random_state=42
+    )
+    model_1 = XGBClassifier(
+        n_estimators=500,
+        max_depth=3,
+        learning_rate=0.05,
+        min_child_weight=2,
+        subsample=0.7,
+        colsample_bytree=0.8,
+        gamma=0.1,
+        reg_alpha=0,
+        reg_lambda=1,
+        random_state=42,
+        eval_metric='logloss'
+    )
+
+    model_0 = XGBClassifier(
+        n_estimators=500,
+        max_depth=3,
+        learning_rate=0.05,
+        min_child_weight=2,
+        subsample=0.7,
+        colsample_bytree=0.8,
+        gamma=0.1,
+        reg_alpha=0,
+        reg_lambda=1,
+        random_state=42,
+        eval_metric='logloss'
+    )
+    # model_1 = LogisticRegression(
+    #     max_iter=2000,  # Increase number of iterations
+    #     solver='lbfgs',  # Switch to a more stable solver
+    #     C=1e10,  # Reduce regularization (close to no regularization)
+    #     fit_intercept=False,  # Ensure fitting intercept
+    #     random_state=42  # Fix random seed
+    # )
+    # model_0 = LogisticRegression(
+    #     max_iter=2000,  # Increase number of iterations
+    #     solver='lbfgs',  # Switch to a more stable solver
+    #     C=1e10,  # Reduce regularization (close to no regularization)
+    #     fit_intercept=False,  # Ensure fitting intercept
+    #     random_state=42  # Fix random seed
+    # )
+
+    if len(X_treated) > 0:
+        model_1.fit(X_treated, S_treated)
+    if len(X_control) > 0:
+        model_0.fit(X_control, S_control)
+
+    X_with_A = np.column_stack((X_train, A_train))
+    # model = LinearRegression()
+    model = SVR(
+        kernel='poly',  # Specify using polynomial kernel
+        degree=2,  # Degree of the polynomial, default is 3
+        gamma='scale',  # Kernel coefficient, 'scale' means 1/(n_features*X.var())
+        coef0=1,  # Constant term in kernel function, affects relative importance of high-degree and low-degree terms
+        C=5.0,  # Regularization parameter
+        epsilon=0.01,  # epsilon bandwidth
+        tol=1e-4,  # Convergence tolerance
+        max_iter=-1  # Maximum number of iterations, -1 means unlimited
+    )
+    # model = SVR(
+    #     kernel='linear',  # Use linear kernel
+    #     C=1.0,  # Regularization parameter
+    #     epsilon=0.1,  # epsilon bandwidth
+    #     tol=1e-3,  # Convergence tolerance
+    #     max_iter=-1  # Maximum number of iterations, -1 means unlimited
+    # )
+    model = KernelRidge(
+        alpha=0.8,  # Regularization parameter
+        kernel='polynomial',  # Use polynomial kernel
+        degree=3,  # Polynomial degree
+        coef0=1,  # Constant term
+        gamma=None  # Kernel coefficient, None means 1/n_features
+    )
+    model = RandomForestRegressor(
+        n_estimators=100,
+        max_depth=12,
+        min_samples_split=20,
+        min_samples_leaf=5,
+        random_state=42
+    )
+    model = LogisticRegression(
+        max_iter=2000,  # Increase number of iterations
+        solver='lbfgs',  # Switch to a more stable solver
+        C=1e10,  # Reduce regularization (close to no regularization)
+        fit_intercept=True,  # Ensure fitting intercept
+        random_state=42  # Fix random seed
+    )
+    model.fit(X_with_A, S_train)
+
+    # Predict outcomes for X under A=1 and A=0
+    X_with_A_1 = np.column_stack((X_train, np.ones(X_train.shape[0])))
+    X_with_A_0 = np.column_stack((X_train, np.zeros(X_train.shape[0])))
+
+    S_hat_1 = model.predict(X_with_A_1)
+    S_hat_0 = model.predict(X_with_A_0)
+
+    # The estimated CATE is the difference between the two
+    return model_1, model_0, S_hat_1 - S_hat_0
+
+# Estimate decision rules π_Y(X) and π_S(X)
+def estimate_decision_rules(tau_Y_hat, tau_S_hat, lambda_val):
+
+    # q_lambda = np.quantile(tau_Y_hat, 1 - lambda_val)
+    # s_lambda = np.quantile(tau_S_hat, 1 - lambda_val)
+    pi_Y_hat = (tau_Y_hat > 0).astype(int)
+    pi_S_hat = (tau_S_hat > 0).astype(int)
+    return pi_Y_hat, pi_S_hat
+
+# Compute R_n
+def compute_R_n(pi_Y_hat, pi_S_hat, A, e_hat, Y, mu_A_hat, tau_Y_hat):
+    # Use looser truncation bounds
+    e_hat = np.clip(e_hat, 0.3, 0.7)
+
+    # Compute IPW weights (A/e_hat(X) - (1-A)/(1-e_hat(X)))
+    ipw_weights = A / e_hat - (1 - A) / (1 - e_hat)
+
+    # Handle extreme weight values
+    # Use winsorization instead of simple truncation
+    q99 = np.percentile(np.abs(ipw_weights), 90)
+    ipw_weights = np.sign(ipw_weights) * np.minimum(np.abs(ipw_weights), q99)
+
+    # Compute residuals (Y - mu_A_hat(X))
+    residuals = Y - mu_A_hat
+
+    # Compute decision difference (pi_Y_hat(X) - pi_S_hat(X))
+    decision_diff = pi_Y_hat - pi_S_hat
+
+    # Compute part 1: [pi_Y_hat(X) - pi_S_hat(X)] * (A/e_hat(X) - (1-A)/(1-e_hat(X))) * [Y - mu_A_hat(X)]
+    part1 = decision_diff * ipw_weights * residuals
+
+    # Compute part 2: tau_Y_hat(X) * [pi_Y_hat(X) - pi_S_hat(X)]
+    part2 = tau_Y_hat * decision_diff
+
+    # Compute the value for each sample and take the average
+    individual_values = part1 + part2
+    R_n = np.mean(individual_values)
+
+    return R_n, individual_values
+
+
+# Compute true R (using Monte Carlo integration)
+def compute_R(n_samples=100000, seed=None):
+    """
+    Compute true expected R using Monte Carlo integration
+
+    R = E{ [pi_{Y, lambda}(X) - pi_{S, lambda}(X)](A/e(X) -
+    (1-A)/(1-e(X)))[Y - mu_A(X)] + tau_Y(X) * [pi_{Y, lambda}(X) - pi_{S, lambda}(X)] }
+
+    Approximate this expectation by generating a large number of samples from the true distribution and computing the average.
+    """
+    if seed is not None:
+        np.random.seed(seed)
+
+    lambda_val=lambda_val_f()
+    # Generate a large number of samples for Monte Carlo integration
+    # Generate covariates X
+    X = generate_X(n_samples)
+
+    # Compute true propensity score e(X)
+    propensity_score = propensity_score_f(X)
+    propensity_score = np.clip(propensity_score, 0.3, 0.7)
+
+    # Generate treatment variable A
+    A = np.random.binomial(1, propensity_score, size=n_samples)
+
+    # Compute true tau_Y(X) and tau_S(X)
+    # tau_Y_true = 0.1 * (X[:, 0] ** 2 + X[:, 1] ** 2) + 1.8 * X[:, 0] + 1.5 * X[:, 1]
+    # tau_S_true = 0.1 * (X[:, 0] ** 2 + X[:, 1] ** 2) + 0.6 * X[:, 0] - 0.3 * X[:, 1]
+    mu_1_true, mu_0_true, smu_1, smu_0, Y_1, Y_0, S_1, S_0 = generate_SY(n_samples, X)
+
+    tau_Y_true = mu_1_true - mu_0_true
+    tau_S_true = smu_1 - smu_0
+
+    q_lambda = np.quantile(tau_Y_true, 1 - lambda_val)
+    s_lambda = np.quantile(tau_S_true, 1 - lambda_val)
+
+    # Generate true decision rules
+    pi_Y_true, pi_S_true = estimate_decision_rules(tau_Y_true, tau_S_true, lambda_val=lambda_val_f())
+    # pi_Y_true = ((tau_Y_true > q_lambda) & (tau_Y_true > 0)).astype(int)
+    # pi_S_true = ((tau_S_true > s_lambda) & (tau_S_true > 0)).astype(int)
+
+    # Generate observed outcomes Y = A*Y(1) + (1-A)*Y(0)
+    Y = A * Y_1 + (1 - A) * Y_0
+
+    # Compute μ_A(X) = A*μ_1(X) + (1-A)*μ_0(X)
+    mu_A_true = A * mu_1_true + (1 - A) * mu_0_true
+
+    # Use looser truncation bounds
+    e_true = np.clip(propensity_score, 0.3, 0.7)
+
+    # Compute IPW weights (A/e(X) - (1-A)/(1-e(X)))
+    ipw_weights = A / e_true - (1 - A) / (1 - e_true)
+
+    # Handle extreme weight values, using the same method as computing R_n
+    q99 = np.percentile(np.abs(ipw_weights), 90)
+    ipw_weights = np.sign(ipw_weights) * np.minimum(np.abs(ipw_weights), q99)
+
+    # Compute residuals (Y - mu_A(X))
+    residuals = Y - mu_A_true
+
+    # Compute decision difference (pi_Y(X) - pi_S(X))
+    decision_diff = pi_Y_true - pi_S_true
+
+    # Compute part 1: [pi_Y(X) - pi_S(X)] * (A/e(X) - (1-A)/(1-e(X))) * [Y - mu_A(X)]
+    part1 = (pi_Y_true - pi_S_true) * ipw_weights * residuals
+
+    # Compute part 2: tau_Y(X) * [pi_Y(X) - pi_S(X)]
+    part2 = tau_Y_true * decision_diff
+    # print(tau_Y_true.mean(), decision_diff.mean())
+
+    # Compute the value for each sample and take the average (Monte Carlo integration)
+    individual_values = part2
+    R = np.mean(individual_values)
+    print(np.mean(part1))
+    print(pi_Y_true, pi_S_true)
+
+    return R
+
+
+# ===== The following are newly added V-related functions =====
+
+# Compute true V (using Monte Carlo integration)
+def compute_V(n_samples=100000, lambda_val=lambda_val_f(), seed=None):
+    """
+    Compute true expected V using Monte Carlo integration
+
+    V(\lambda) = E[ tau_Y(X) * (pi_{S, \lambda}(X) - \lambda) ]
+
+    Approximate this expectation by generating a large number of samples from the true distribution and computing the average.
+    """
+    if seed is not None:
+        np.random.seed(seed)
+
+    # Generate a large number of samples for Monte Carlo integration
+    # Generate covariates X
+    X = generate_X(n_samples)
+    lambda_val = lambda_val_f()
+
+    # Compute true propensity score e(X)
+    propensity_score = propensity_score_f(X)
+    propensity_score = np.clip(propensity_score, 0.3, 0.7)
+
+    # Generate treatment variable A
+    A = np.random.binomial(1, propensity_score, size=n_samples)
+
+    # Compute true tau_Y(X) and tau_S(X)
+    mu_1, mu_0, smu_1, smu_0, Y_1, Y_0, S_1, S_0 = generate_SY(n_samples, X)
+
+    tau_Y_true = mu_1 - mu_0
+    tau_S_true = smu_1 - smu_0
+
+    s_lambda = np.quantile(tau_S_true, 1 - lambda_val)
+
+    # Generate true decision rules pi_{S, \lambda}(X)
+    _, pi_S_true = estimate_decision_rules(tau_Y_true, tau_S_true, lambda_val=lambda_val_f())
+
+    # Compute V = E[tau_Y(X) * (pi_{S, \lambda}(X) - \lambda)]
+    # Only need the second part, because the expectation of the first part is 0 (similar to taking only part2 in the R function)
+    individual_values = tau_Y_true * (pi_S_true - lambda_val)
+    V = np.mean(individual_values)
+
+    return V
+
+# Compute V_n (estimated value)
+def compute_V_n(pi_S_hat, A, e_hat, Y, mu_A_hat, tau_Y_hat, lambda_val):
+    """
+    Compute the estimated value of surrogate efficiency V_n
+
+    Influence function:
+    psi_lambda(Y, A, X; eta_lambda) = [pi_{S, lambda}(X) - lambda] *
+    {A/e(X) - (1-A)/(1-e(X))} * [Y - mu_A(X)] + tau_Y(X) * [pi_{S, lambda}(X) - lambda]
+    """
+    # Use looser truncation bounds
+    e_hat = np.clip(e_hat, 0.3, 0.7)
+
+    # Compute IPW weights (A/e_hat(X) - (1-A)/(1-e_hat(X)))
+    ipw_weights = A / e_hat - (1 - A) / (1 - e_hat)
+
+    # Handle extreme weight values
+    q99 = np.percentile(np.abs(ipw_weights), 90)
+    ipw_weights = np.sign(ipw_weights) * np.minimum(np.abs(ipw_weights), q99)
+
+    # Compute residuals (Y - mu_A_hat(X))
+    residuals = Y - mu_A_hat
+
+    # Compute decision difference (pi_S_hat(X) - lambda)
+    decision_diff = pi_S_hat - lambda_val
+
+    # Compute part 1: [pi_S_hat(X) - lambda] * (A/e_hat(X) - (1-A)/(1-e_hat(X))) * [Y - mu_A_hat(X)]
+    part1 = decision_diff * ipw_weights * residuals
+
+    # Compute part 2: tau_Y_hat(X) * [pi_S_hat(X) - lambda]
+    part2 = tau_Y_hat * decision_diff
+
+    # Compute the value for each sample and take the average
+    individual_values = part1 + part2
+    V_n = np.mean(individual_values)
+
+    return V_n, individual_values
+
+# ---------------------compute G------------------------
+
+def compute_G(n_samples=100000, lambda_val=lambda_val_f(), seed=None):
+    """
+    Compute true expected V using Monte Carlo integration
+
+    G(\lambda) = E[ tau_Y(X) * (pi_{S, \lambda}(X) - \lambda) ]
+
+    Approximate this expectation by generating a large number of samples from the true distribution and computing the average.
+    """
+    if seed is not None:
+        np.random.seed(seed)
+
+    # Generate a large number of samples for Monte Carlo integration
+    # Generate covariates X
+    X = generate_X(n_samples)
+
+    # Compute true propensity score e(X)
+    propensity_score = propensity_score_f(X)
+    propensity_score = np.clip(propensity_score, 0.3, 0.7)
+
+    # Generate treatment variable A
+    A = np.random.binomial(1, propensity_score, size=n_samples)
+
+    # Compute true tau_Y(X) and tau_S(X)
+    mu_1_true, mu_0_true, smu_1, smu_0, Y_1, Y_0, S_1, S_0 = generate_SY(n_samples, X)
+
+    tau_Y_true = mu_1_true - mu_0_true
+    tau_S_true = smu_1 - smu_0
+
+    # Calculate quantile
+    s_lambda = np.quantile(tau_S_true, 1 - lambda_val)
+
+    # Generate true decision rules pi_{S, \lambda}(X)
+    _, pi_S_true = estimate_decision_rules(tau_Y_true, tau_S_true, lambda_val=lambda_val_f())
+
+    # Compute V = E[tau_Y(X) * (pi_{S, \lambda}(X) - \lambda)]
+    # Only need the second part, because the expectation of the first part is 0 (similar to taking only part2 in the R function)
+    individual_values = tau_Y_true * pi_S_true
+    G = np.mean(individual_values)
+
+    return G
+
+# Compute G_n (estimated value)
+def compute_G_n(pi_S_hat, A, e_hat, Y, mu_0_hat, mu_A_hat, tau_Y_hat):
+    """
+    Compute the estimated value of surrogate efficiency V_n
+
+    Influence function:
+    psi_lambda(Y, A, X; eta_lambda) = [pi_{S, lambda}(X) - lambda] *
+    {A/e(X) - (1-A)/(1-e(X))} * [Y - mu_A(X)] + tau_Y(X) * [pi_{S, lambda}(X) - lambda]
+    """
+    # Use looser truncation bounds
+    e_hat = np.clip(e_hat, 0.3, 0.7)
+
+    # Compute IPW weights (A/e_hat(X) - (1-A)/(1-e_hat(X)))
+    ipw_weights_2 = A / e_hat - (1 - A) / (1 - e_hat)
+
+    # Handle extreme weight values
+    # Use winsorization instead of simple truncation
+    q99 = np.percentile(np.abs(ipw_weights_2), 90)
+    ipw_weights_2 = np.sign(ipw_weights_2) * np.minimum(np.abs(ipw_weights_2), q99)
+
+    # Compute residuals (Y - mu_A_hat(X))
+    residuals_1 = Y - mu_0_hat
+    residuals_2 = Y - mu_A_hat
+
+    # Compute part 1
+    part1 = pi_S_hat * ipw_weights_2 * residuals_2
+
+    # Compute part 2
+    part2 = tau_Y_hat * pi_S_hat
+
+    # Compute the value for each sample and take the average
+    individual_values = part1 + part2
+    G_n = np.mean(individual_values)
+
+    return G_n, individual_values
+
+def bootstrap_confidence_interval(X_test, A_test, Y_test, S_test,
+                                  propensity_model, mu_1_model, mu_0_model,
+                                  tau_Y_model_1, tau_Y_model_0, tau_S_model_1,
+                                  tau_S_model_0, lambda_val, n_bootstrap=10000, alpha=0.05):
+    """
+    Use bootstrap method to estimate the sampling distribution of R_n and construct confidence intervals
+
+    Parameters:
+    - X_test, A_test, Y_test, S_test: Test set data
+    - propensity_model, mu_1_model, mu_0_model, tau_Y_model, tau_S_model: Estimated models
+    - n_bootstrap: Number of bootstrap repetitions
+    - alpha: Significance level (e.g., 0.05 for 95% CI)
+
+    Returns:
+    - R_n: Point estimate
+    - bootstrap_means: Mean of R_n from bootstrap samples
+    - bootstrap_vars: Variance of R_n from bootstrap samples
+    - ci_lower, ci_upper: Confidence interval of R
+    """
+    bootstrap_Rns = []
+    bootstrap_Vns = []
+    bootstrap_Gns = []
+
+    n_samples = len(X_test)
+    lambda_val=lambda_val_f()
+
+    # Pre-compute all predictions on the test set to avoid redundant calculations
+    e_hat_test = propensity_model.predict_proba(X_test)[:, 1]
+    e_hat_test = np.clip(e_hat_test, 0.3, 0.7)  # Avoid extreme values
+
+    if hasattr(mu_1_model, 'predict'):
+        mu_1_hat_test = mu_1_model.predict(X_test)
+    else:
+        mu_1_hat_test = np.zeros(n_samples)
+
+    if hasattr(mu_0_model, 'predict'):
+        mu_0_hat_test = mu_0_model.predict(X_test)
+    else:
+        mu_0_hat_test = np.zeros(n_samples)
+
+    mu_A_hat_test = A_test * mu_1_hat_test + (1 - A_test) * mu_0_hat_test
+
+    X_test_with_A_1 = np.column_stack((X_test, np.ones(n_samples)))
+    X_test_with_A_0 = np.column_stack((X_test, np.zeros(n_samples)))
+
+    tau_Y_hat_test = tau_Y_model_1.predict(X_test) - tau_Y_model_0.predict(X_test)
+    tau_S_hat_test = tau_S_model_1.predict(X_test) - tau_S_model_0.predict(X_test)
+
+    pi_Y_hat_test, pi_S_hat_test = estimate_decision_rules(tau_Y_hat_test, tau_S_hat_test, lambda_val=lambda_val_f())
+    # Compute original R_n
+    R_n, individual_values = compute_R_n(
+        pi_Y_hat_test,
+        pi_S_hat_test,
+        A_test,
+        e_hat_test,
+        Y_test,
+        mu_A_hat_test,
+        tau_Y_hat_test
+    )
+
+    # Perform bootstrap resampling
+    rng = np.random.RandomState(42)  # Set random seed to ensure reproducibility
+
+    for _ in range(n_bootstrap):
+        # Sample indices with replacement
+        bootstrap_indices = rng.choice(n_samples, size=n_samples, replace=True)
+        bootstrap_values = individual_values[bootstrap_indices]
+        bootstrap_Rn = np.mean(bootstrap_values)
+        bootstrap_Rns.append(bootstrap_Rn)
+
+    # Compute statistics of the bootstrap distribution
+    bootstrap_Rns = np.array(bootstrap_Rns)
+    bootstrap_mean = np.mean(bootstrap_Rns)
+    bootstrap_var = np.var(bootstrap_Rns)
+    bootstrap_std = np.sqrt(bootstrap_var)
+
+    # Compute confidence interval based on normal approximation
+    # Method 1: Use standard normal quantiles and bootstrap standard deviation
+    z_alpha = stats.norm.ppf(1 - alpha / 2)
+    ci_normal_lower = R_n - z_alpha * bootstrap_std
+    ci_normal_upper = R_n + z_alpha * bootstrap_std
+
+    # Method 2: Use quantiles of the bootstrap distribution (non-parametric method)
+    ci_percentile_lower = np.percentile(bootstrap_Rns, 100 * alpha / 2)
+    ci_percentile_upper = np.percentile(bootstrap_Rns, 100 * (1 - alpha / 2))
+
+    # Return results from both confidence interval methods
+    bootstrap_results_R = {
+        'R_n': R_n,
+        'bootstrap_mean': bootstrap_mean,
+        'bootstrap_var': bootstrap_var,
+        'bootstrap_std': bootstrap_std,
+        'ci_normal': (ci_normal_lower, ci_normal_upper),
+        'ci_percentile': (ci_percentile_lower, ci_percentile_upper),
+        'bootstrap_distribution': bootstrap_Rns
+    }
+
+    V_n, individual_values = compute_V_n(
+        pi_S_hat_test,
+        A_test,
+        e_hat_test,
+        Y_test,
+        mu_A_hat_test,
+        tau_Y_hat_test,
+        lambda_val=lambda_val_f()
+    )
+
+    # Perform bootstrap resampling
+    rng = np.random.RandomState(42)
+
+    for _ in range(n_bootstrap):
+        bootstrap_indices = rng.choice(n_samples, size=n_samples, replace=True)
+        bootstrap_values = individual_values[bootstrap_indices]
+        bootstrap_Vn = np.mean(bootstrap_values)
+        bootstrap_Vns.append(bootstrap_Vn)
+
+    # Compute statistics of the bootstrap distribution
+    bootstrap_Vns = np.array(bootstrap_Vns)
+    bootstrap_mean = np.mean(bootstrap_Vns)
+    bootstrap_var = np.var(bootstrap_Vns)
+    bootstrap_std = np.sqrt(bootstrap_var)
+
+    # Compute confidence interval
+    z_alpha = stats.norm.ppf(1 - alpha / 2)
+    ci_normal_lower = V_n - z_alpha * bootstrap_std
+    ci_normal_upper = V_n + z_alpha * bootstrap_std
+
+    ci_percentile_lower = np.percentile(bootstrap_Vns, 100 * alpha / 2)
+    ci_percentile_upper = np.percentile(bootstrap_Vns, 100 * (1 - alpha / 2))
+
+    bootstrap_results_V = {
+        'V_n': V_n,
+        'bootstrap_mean': bootstrap_mean,
+        'bootstrap_var': bootstrap_var,
+        'bootstrap_std': bootstrap_std,
+        'ci_normal': (ci_normal_lower, ci_normal_upper),
+        'ci_percentile': (ci_percentile_lower, ci_percentile_upper),
+        'bootstrap_distribution': bootstrap_Vns
+    }
+
+    G_n, individual_values = compute_G_n(
+        pi_S_hat_test,
+        A_test,
+        e_hat_test,
+        Y_test,
+        mu_0_hat_test,
+        mu_A_hat_test,
+        tau_Y_hat_test
+    )
+
+    # Perform bootstrap resampling
+    rng = np.random.RandomState(42)
+
+    for _ in range(n_bootstrap):
+        bootstrap_indices = rng.choice(n_samples, size=n_samples, replace=True)
+        bootstrap_values = individual_values[bootstrap_indices]
+        bootstrap_Gn = np.mean(bootstrap_values)
+        bootstrap_Gns.append(bootstrap_Gn)
+
+    # Compute statistics of the bootstrap distribution
+    bootstrap_Gns = np.array(bootstrap_Gns)
+    bootstrap_mean = np.mean(bootstrap_Gns)
+    bootstrap_var = np.var(bootstrap_Gns)
+    bootstrap_std = np.sqrt(bootstrap_var)
+
+    # Compute confidence interval
+    z_alpha = stats.norm.ppf(1 - alpha / 2)
+    ci_normal_lower = G_n - z_alpha * bootstrap_std
+    ci_normal_upper = G_n + z_alpha * bootstrap_std
+
+    ci_percentile_lower = np.percentile(bootstrap_Gns, 100 * alpha / 2)
+    ci_percentile_upper = np.percentile(bootstrap_Gns, 100 * (1 - alpha / 2))
+
+    bootstrap_results_G = {
+        'G_n': G_n,
+        'bootstrap_mean': bootstrap_mean,
+        'bootstrap_var': bootstrap_var,
+        'bootstrap_std': bootstrap_std,
+        'ci_normal': (ci_normal_lower, ci_normal_upper),
+        'ci_percentile': (ci_percentile_lower, ci_percentile_upper),
+        'bootstrap_distribution': bootstrap_Gns
+    }
+
+    return bootstrap_results_R, bootstrap_results_V, bootstrap_results_G
+
+
+def evaluate_coverage(true_R, bootstrap_results, alpha=0.05):
+    """
+    Evaluate coverage of confidence intervals
+
+    Parameters:
+    - true_R: True R value
+    - bootstrap_results: Dictionary of results from bootstrap method
+    - alpha: Significance level
+
+    Returns:
+    - coverage_metrics: Dictionary containing coverage metrics
+    """
+    # Check coverage of normal approximation method
+    ci_normal_lower, ci_normal_upper = bootstrap_results['ci_normal']
+    normal_covers = (ci_normal_lower <= true_R <= ci_normal_upper)
+
+    # Check coverage of percentile method
+    ci_percentile_lower, ci_percentile_upper = bootstrap_results['ci_percentile']
+    percentile_covers = (ci_percentile_lower <= true_R <= ci_percentile_upper)
+
+    # Compute interval length
+    normal_length = ci_normal_upper - ci_normal_lower
+    percentile_length = ci_percentile_upper - ci_percentile_lower
+
+    return {
+        'normal_covers': normal_covers,
+        'percentile_covers': percentile_covers,
+        'normal_length': normal_length,
+        'percentile_length': percentile_length,
+        'expected_coverage': 1 - alpha
+    }
+
+# Modify single_experiment function to include bootstrap estimation
+def single_experiment_with_bootstrap(n_samples=2000, seed=None, true_R=None, true_V=None, true_G=None,
+                                     n_bootstrap=1000, alpha=0.05):
+    if seed is not None:
+        np.random.seed(seed)
+
+    # Generate data
+    data = generate_data(n_samples=n_samples, seed=seed)
+    X, A, Y, S = data['X'], data['A'], data['Y'], data['S']
+
+    # Split data into three parts
+    X_train1, X_rest, A_train1, A_rest, Y_train1, Y_rest, S_train1, S_rest = train_test_split(
+        X, A, Y, S, test_size=2 / 3, random_state=seed)
+
+    X_train2, X_test, A_train2, A_test, Y_train2, Y_test, S_train2, S_test = train_test_split(
+        X_rest, A_rest, Y_rest, S_rest, test_size=1 / 2, random_state=seed)
+
+    # Use the first part of data to estimate models
+    # 1. Estimate propensity score e(X)
+    propensity_model = estimate_propensity_score(X_train1, A_train1)
+
+    # 2. Estimate conditional expectation μ_a(X)
+    mu_1_model, mu_0_model = estimate_conditional_expectation(X_train1, A_train1, Y_train1)
+
+    # 3. Estimate CATE tau_Y(X)
+    tau_Y_model_1, tau_Y_model_0, _ = estimate_tau_Y(X_train1, A_train1, Y_train1)
+
+    # 4. Estimate CATE tau_S(X)
+    tau_S_model_1, tau_S_model_0, _ = estimate_tau_S(X_train1, A_train1, S_train1)
+
+    # Use bootstrap method to estimate confidence intervals
+    bootstrap_results_R, bootstrap_results_V, bootstrap_results_G = bootstrap_confidence_interval(
+        X_test, A_test, Y_test, S_test,
+        propensity_model, mu_1_model, mu_0_model,
+        tau_Y_model_1, tau_Y_model_0, tau_S_model_1, tau_S_model_0, lambda_val=lambda_val_f(),
+        n_bootstrap=n_bootstrap, alpha=alpha
+    )
+
+    # Evaluate coverage (if true_R is provided)
+    coverage_metrics = None
+    if true_R is not None:
+        coverage_metrics = evaluate_coverage(true_R, bootstrap_results_R, alpha=alpha)
+
+    # Predict e_hat on the test set
+    e_hat_test = propensity_model.predict_proba(X_test)[:, 1]
+
+    # Compute sqrt(n) * (R_n - R)
+    n_test = len(X_test)
+    R_n = bootstrap_results_R['R_n']
+    statistic = np.sqrt(n_test) * (R_n - true_R) if true_R is not None else None
+
+    exp_result_R = {
+        'statistic': statistic,
+        'R_n': R_n,
+        'n_test': n_test,
+        'bootstrap_results': bootstrap_results_R,
+        'coverage_metrics': coverage_metrics
+    }
+
+    coverage_metrics = None
+    if true_V is not None:
+        coverage_metrics = evaluate_coverage(true_V, bootstrap_results_V, alpha=alpha)
+
+    # Compute sqrt(n) * (V_n - V)
+    V_n = bootstrap_results_V['V_n']
+    statistic = np.sqrt(n_test) * (V_n - true_V) if true_V is not None else None
+
+    exp_result_V = {
+        'statistic': statistic,
+        'V_n': V_n,
+        'n_test': n_test,
+        'bootstrap_results': bootstrap_results_V,
+        'coverage_metrics': coverage_metrics
+    }
+
+    coverage_metrics = None
+    if true_G is not None:
+        coverage_metrics = evaluate_coverage(true_G, bootstrap_results_G, alpha=alpha)
+
+    # Compute sqrt(n) * (G_n - G)
+    G_n = bootstrap_results_G['G_n']
+    statistic = np.sqrt(n_test) * (G_n - true_G) if true_G is not None else None
+
+    exp_result_G = {
+        'statistic': statistic,
+        'G_n': G_n,
+        'n_test': n_test,
+        'bootstrap_results': bootstrap_results_G,
+        'coverage_metrics': coverage_metrics
+    }
+    return exp_result_R, exp_result_V, exp_result_G
+
+
+# Run multiple experiments for evaluation
+def run_coverage_experiments(n_experiments=100, n_samples=2000,
+                             n_bootstrap=1000, alpha=0.05):
+    """
+    Run multiple experiments and evaluate the coverage of confidence intervals
+    """
+    # First compute the true R value (only need to compute once)
+    print("Compute true R value...")
+    true_R = compute_R(n_samples=100000, seed=42)
+    true_V = compute_V(n_samples=100000, seed=42)
+    true_G = compute_G(n_samples=100000, seed=42)
+    print(f"True R value: {true_R:.6f}")
+    # print(f"True V value: {true_V:.6f}")
+    # print(f"True G value: {true_G:.6f}")
+
+    results_R = []
+    normal_covers_R = []
+    percentile_covers_R = []
+    results_V = []
+    normal_covers_V = []
+    percentile_covers_V = []
+    results_G = []
+    normal_covers_G = []
+    percentile_covers_G = []
+
+    for i in range(n_experiments):
+        if (i + 1) % 10 == 0:
+            print(f"Running experiment {i + 1}/{n_experiments}")
+
+        exp_result_R, exp_result_V, exp_result_G = (
+            single_experiment_with_bootstrap(
+            n_samples=n_samples, seed=i,
+            true_R=true_R, true_V=true_V, true_G=true_G,
+            n_bootstrap=n_bootstrap, alpha=alpha
+        ))
+
+        results_R.append(exp_result_R)
+        results_V.append(exp_result_V)
+        results_G.append(exp_result_G)
+
+        if exp_result_R['coverage_metrics']:
+            normal_covers_R.append(exp_result_R['coverage_metrics']['normal_covers'])
+            percentile_covers_R.append(exp_result_R['coverage_metrics']['percentile_covers'])
+        if exp_result_V['coverage_metrics']:
+            normal_covers_V.append(exp_result_V['coverage_metrics']['normal_covers'])
+            percentile_covers_V.append(exp_result_V['coverage_metrics']['percentile_covers'])
+        if exp_result_G['coverage_metrics']:
+            normal_covers_G.append(exp_result_G['coverage_metrics']['normal_covers'])
+            percentile_covers_G.append(exp_result_G['coverage_metrics']['percentile_covers'])
+
+    # Compute coverage
+    normal_coverage_R = np.mean(normal_covers_R)
+    percentile_coverage_R = np.mean(percentile_covers_R)
+
+    print(f"\nCoverage evaluation results (expected coverage: {1 - alpha:.2f}):")
+    print(f"Normal approximation method coverage: {normal_coverage_R:.4f}")
+    print(f"Percentile method coverage: {percentile_coverage_R:.4f}")
+
+    # Compute mean and variance of statistics
+    statistics = [r['statistic'] for r in results_R]
+    Rns = [r['R_n'] for r in results_R]
+
+    # Create results similar to the table in the paper
+    table_data_R = {
+        'Bias': np.mean(Rns) - true_R,
+        'SD': np.std(Rns),
+        'ESE': np.mean([r['bootstrap_results']['bootstrap_std'] for r in results_R]),
+        'CP95 (Normal)': normal_coverage_R,
+        'CP95 (Percentile)': percentile_coverage_R
+    }
+
+    # Compute coverage
+    normal_coverage_V = np.mean(normal_covers_V)
+    percentile_coverage_V = np.mean(percentile_covers_V)
+
+    print(f"\nCoverage evaluation results (expected coverage: {1 - alpha:.2f}):")
+    print(f"Normal approximation method coverage: {normal_coverage_V:.4f}")
+    print(f"Percentile method coverage: {percentile_coverage_V:.4f}")
+
+    # Compute mean and variance of statistics
+    statistics = [r['statistic'] for r in results_V]
+    Vns = [r['V_n'] for r in results_V]
+
+    # Create results similar to the table in the paper
+    table_data_V = {
+        'Bias': np.mean(Vns) - true_V,
+        'SD': np.std(Vns),
+        'ESE': np.mean([r['bootstrap_results']['bootstrap_std'] for r in results_V]),
+        'CP95 (Normal)': normal_coverage_V,
+        'CP95 (Percentile)': percentile_coverage_V
+    }
+
+    # Compute coverage
+    normal_coverage_G = np.mean(normal_covers_G)
+    percentile_coverage_G = np.mean(percentile_covers_G)
+
+    print(f"\nCoverage evaluation results (expected coverage: {1 - alpha:.2f}):")
+    print(f"Normal approximation method coverage: {normal_coverage_G:.4f}")
+    print(f"Percentile method coverage: {percentile_coverage_G:.4f}")
+
+    # Compute mean and variance of statistics
+    statistics = [r['statistic'] for r in results_G]
+    Gns = [r['G_n'] for r in results_G]
+
+    # Create results similar to the table in the paper
+    table_data_R = {
+        'Bias': np.mean(Rns) - true_R,
+        'SD': np.std(Rns),
+        'ESE': np.mean([r['bootstrap_results']['bootstrap_std'] for r in results_R]),
+        'CP95 (Normal)': normal_coverage_R,
+        'CP95 (Percentile)': percentile_coverage_R
+    }
+    table_data_V = {
+        'Bias': np.mean(Vns) - true_V,
+        'SD': np.std(Vns),
+        'ESE': np.mean([r['bootstrap_results']['bootstrap_std'] for r in results_V]),
+        'CP95 (Normal)': normal_coverage_V,
+        'CP95 (Percentile)': percentile_coverage_V
+    }
+    table_data_G = {
+        'Bias': np.mean(Gns) - true_G,
+        'SD': np.std(Gns),
+        'ESE': np.mean([r['bootstrap_results']['bootstrap_std'] for r in results_G]),
+        'CP95 (Normal)': normal_coverage_G,
+        'CP95 (Percentile)': percentile_coverage_G
+    }
+
+    print("\nSimulation results:")
+    for key, value in table_data_R.items():
+        print(f"{key}: {value:.4f}")
+    print("\nSimulation results:")
+    for key, value in table_data_V.items():
+        print(f"{key}: {value:.4f}")
+    print("\nSimulation results:")
+    for key, value in table_data_G.items():
+        print(f"{key}: {value:.4f}")
+
+    # Visualize a sample bootstrap distribution
+    example_idx = 0  # Select the first experiment as an example
+    # print("\nPlot the bootstrap distribution of the first experiment...")
+    # plot_bootstrap_results(results_R[example_idx]['bootstrap_results'], true_R)
+
+    return results_R, results_V, results_G, table_data_R, table_data_V, table_data_G
+
+def main():
+    """
+    # First verify margin condition
+    print("First verify margin condition...")
+    alpha_Y, alpha_S, local_alphas_Y, local_alphas_S = verify_margin_condition()
+
+    # Check local alpha values to determine if margin condition is satisfied
+    if np.mean(local_alphas_Y) > 1.0 and np.mean(local_alphas_S) > 1.0:
+        print("Margin condition satisfied: average of local alpha_Y and alpha_S are both > 1")
+    else:
+        print("Warning: Margin condition may not be satisfied!")
+        if np.mean(local_alphas_Y) <= 1.0:
+            print(f"Average of local alpha_Y = {np.mean(local_alphas_Y):.4f} <= 1")
+        if np.mean(local_alphas_S) <= 1.0:
+            print(f"Average of local alpha_S = {np.mean(local_alphas_S):.4f} <= 1")
+        print("But theoretical analysis shows that for very small t values, alpha should be slightly greater than 1")
+    """
+    """    
+    # Run multiple experiments to get distribution
+    n_experiments = 300  # Number of experiments
+    n_samples = 1500  # Sample size per experiment
+
+    statistics, Rns, true_R, n_test = run_experiments(n_experiments, n_samples)
+
+    # Print results
+    print(f"\nConducted {n_experiments} experiments, test set sample size per experiment is {n_test}")
+    print(f"R_n mean: {np.mean(Rns):.6f}")
+    print(f"True R value: {true_R:.6f}")
+    print(f"sqrt(n) * (R_n - R) : {np.mean(statistics):.6f}")
+    print(f"Standard deviation of sqrt(n) * (R_n - R): {np.std(statistics):.6f}")
+
+    # Test normality
+    shapiro_test, mean, std = test_normality(statistics)
+    """
+
+    # Run coverage experiment for R_n
+    print("=== Analyze Surrogate Regret (R_n) ===")
+    n_experiments = 1000  # Number of experiments
+    n_samples = 3000  # Sample size per experiment
+    n_bootstrap = 5000  # Number of Bootstrap resamplings
+    alpha = 0.05  # Significance level (95% confidence interval)
+
+    results_R, results_V, results_G, table_data_R, table_data_V, table_data_G = (
+        run_coverage_experiments(
+        n_experiments=n_experiments,
+        n_samples=n_samples,
+        n_bootstrap=n_bootstrap,
+        alpha=alpha
+    ))
+
+    # Create a table similar to the one in the paper
+    print("\nR_n simulation results table (similar to the table in the paper):")
+    headers = ["n", "Bias", "SD", "ESE", "CP95 (Normal)", "CP95 (Percentile)"]
+    row_R = [n_samples, table_data_R['Bias'], table_data_R['SD'], table_data_R['ESE'],
+             table_data_R['CP95 (Normal)'], table_data_R['CP95 (Percentile)']]
+
+    # Print formatted table
+    print("-" * 80)
+    print("{:^10} {:^10} {:^10} {:^10} {:^20} {:^20}".format(*headers))
+    print("-" * 80)
+    print("{:^10d} {:^10.4f} {:^10.4f} {:^10.4f} {:^20.4f} {:^20.4f}".format(*row_R))
+    print("-" * 80)
+
+    return {
+        'R_results': results_R,
+        'R_table': table_data_R,
+    }
+
+
+if __name__ == "__main__":
+    results = main()
