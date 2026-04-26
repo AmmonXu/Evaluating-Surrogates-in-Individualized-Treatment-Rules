@@ -381,7 +381,7 @@ def process_real_data(X, A, S, Y, sample_fraction=0.01, alpha=0.05, load_saved_m
 
 def main():
     random.seed(42)
-    df = pd.read_csv("F:/pythonProject/surrogate/criteo-uplift-v2.1.csv")
+    df = pd.read_csv("criteo-uplift-v2.1.csv")
     A = df['treatment'].values
     S = df['exposure'].values
     Y = df['conversion'].values
