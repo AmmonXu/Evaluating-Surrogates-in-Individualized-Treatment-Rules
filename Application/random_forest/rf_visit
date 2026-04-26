@@ -389,7 +389,7 @@ def main():
     X = df[feature_cols].values
 
     # Set load_saved_models=True to use saved models
-    results = process_real_data(X, A, S, Y, sample_fraction=1, alpha=0.05, load_saved_models=True)
+    results = process_real_data(X, A, S, Y, sample_fraction=1, alpha=0.05, load_saved_models=False)
 
 if __name__ == "__main__":
     main()
