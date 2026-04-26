@@ -1,0 +1,395 @@
+import random
+import os
+import joblib
+import numpy as np
+from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from scipy import stats
+import pandas as pd
+import lightgbm as lgb
+import xgboost as xgb
+
+
+# Set random seed to ensure reproducible results
+np.random.seed(42)
+
+MODEL_DIR = "F:/pythonProject/surrogate/simulation/real_data/no_bootstrap/model/saved_models_boosting_exposure"
+lambda_val = 0.15
+
+def save_models(propensity_model, mu_1_model, mu_0_model, tau_Y_model, tau_S_model,
+                X_test, A_test, Y_test, S_test, model_dir=MODEL_DIR):
+    """Save all trained models and test data"""
+    if not os.path.exists(model_dir):
+        os.makedirs(model_dir)
+
+    # Save models
+    joblib.dump(propensity_model, os.path.join(model_dir, 'propensity_model.pkl'))
+    joblib.dump(mu_1_model, os.path.join(model_dir, 'mu_1_model.pkl'))
+    joblib.dump(mu_0_model, os.path.join(model_dir, 'mu_0_model.pkl'))
+    joblib.dump(tau_Y_model, os.path.join(model_dir, 'tau_Y_model.pkl'))
+    joblib.dump(tau_S_model, os.path.join(model_dir, 'tau_S_model.pkl'))
+
+    # Save test data
+    test_data = {
+        'X_test': X_test,
+        'A_test': A_test,
+        'Y_test': Y_test,
+        'S_test': S_test
+    }
+    joblib.dump(test_data, os.path.join(model_dir, 'test_data.pkl'))
+
+    print(f"Models and test data have been saved to {model_dir}")
+
+
+def load_models(model_dir=MODEL_DIR):
+    """Load all trained models and test data"""
+    if not os.path.exists(model_dir):
+        raise FileNotFoundError(f"Model directory {model_dir} does not exist")
+
+    # Load models
+    propensity_model = joblib.load(os.path.join(model_dir, 'propensity_model.pkl'))
+    mu_1_model = joblib.load(os.path.join(model_dir, 'mu_1_model.pkl'))
+    mu_0_model = joblib.load(os.path.join(model_dir, 'mu_0_model.pkl'))
+    tau_Y_model = joblib.load(os.path.join(model_dir, 'tau_Y_model.pkl'))
+    tau_S_model = joblib.load(os.path.join(model_dir, 'tau_S_model.pkl'))
+
+    # Load test data
+    test_data = joblib.load(os.path.join(model_dir, 'test_data.pkl'))
+
+    print(f"Models and test data have been loaded from {model_dir}")
+
+    return propensity_model, mu_1_model, mu_0_model, tau_Y_model, tau_S_model, test_data
+
+# Estimate propensity score e(X) = P(A=1|X)
+def estimate_propensity_score(X, A):
+    model = LogisticRegression(max_iter=1000)
+    model.fit(X, A)
+    return model
+
+
+# Estimate conditional expectation μ_a(X) = E[Y|A=a,X]
+def estimate_conditional_expectation(X, A, Y):
+    # Estimate μ_1(X) and μ_0(X) respectively
+    X_treated = X[A == 1]
+    Y_treated = Y[A == 1]
+    X_control = X[A == 0]
+    Y_control = Y[A == 0]
+
+    model_1 = xgb.XGBRegressor(
+        n_estimators=90,       
+        learning_rate=0.1,      
+        max_depth=5,         
+        subsample=0.8,          
+        colsample_bytree=0.8,   
+        random_state=42,
+        n_jobs=-1
+    )
+    model_0 = xgb.XGBRegressor(
+        n_estimators=90,       
+        learning_rate=0.1,      
+        max_depth=5,         
+        subsample=0.8,          
+        colsample_bytree=0.8,   
+        random_state=42,
+        n_jobs=-1
+    )
+    print(X_treated.shape, Y_treated.shape)
+    if len(X_treated) > 0:
+        model_1.fit(X_treated, Y_treated)
+    if len(X_control) > 0:
+        model_0.fit(X_control, Y_control)
+
+    return model_1, model_0
+
+
+# Estimate CATE tau_Y(X)
+def estimate_tau_Y(X_train, A_train, Y_train):
+    # Estimate CATE using S-learner method
+    X_with_A = np.column_stack((X_train, A_train))
+    model = xgb.XGBRegressor(
+        n_estimators=90,       
+        learning_rate=0.1,      
+        max_depth=5,         
+        subsample=0.8,          
+        colsample_bytree=0.8,   
+        random_state=42,
+        n_jobs=-1
+    )
+    model.fit(X_with_A, Y_train)
+
+    # Predict results for X under A=1 and A=0
+    X_with_A_1 = np.column_stack((X_train, np.ones(X_train.shape[0])))
+    X_with_A_0 = np.column_stack((X_train, np.zeros(X_train.shape[0])))
+
+    Y_hat_1 = model.predict(X_with_A_1)
+    Y_hat_0 = model.predict(X_with_A_0)
+
+    return model, Y_hat_1 - Y_hat_0
+
+
+# Estimate CATE tau_S(X)
+def estimate_tau_S(X_train, A_train, S_train):
+    X_with_A = np.column_stack((X_train, A_train))
+    model = model = xgb.XGBRegressor(
+        n_estimators=100,      
+        learning_rate=0.1,     
+        max_depth=4,         
+        subsample=0.7,         
+        colsample_bytree=0.7, 
+        random_state=42,
+        n_jobs=-1
+    )
+    model.fit(X_with_A, S_train)
+
+    # Predict results for X under A=1 and A=0
+    X_with_A_1 = np.column_stack((X_train, np.ones(X_train.shape[0])))
+    X_with_A_0 = np.column_stack((X_train, np.zeros(X_train.shape[0])))
+
+    S_hat_1 = model.predict(X_with_A_1)
+    S_hat_0 = model.predict(X_with_A_0)
+
+    return model, S_hat_1 - S_hat_0
+
+
+# Estimate decision rules π_Y(X) and π_S(X)
+# def estimate_decision_rules(tau_Y_hat, tau_S_hat):
+#     pi_Y_hat = (tau_Y_hat > 0).astype(int)
+#     pi_S_hat = (tau_S_hat > 0).astype(int)
+#     return pi_Y_hat, pi_S_hat
+
+def estimate_decision_rules(tau_Y_hat, tau_S_hat, lambda_val):
+    def select_top_lambda(tau_hat, lambda_val):
+        n = len(tau_hat)
+        target_count = int(np.round(n * lambda_val))
+
+        # Sort by value in descending order first, get sorted indices
+        sorted_indices = np.argsort(-tau_hat)
+        sorted_values = tau_hat[sorted_indices]
+
+        # Initialize selection array
+        selected = np.zeros(n, dtype=int)
+
+        if target_count == 0:
+            return selected
+
+        # Find the value of the target_count-th element (quantile)
+        threshold = sorted_values[target_count - 1]
+
+        # First select all elements strictly greater than threshold
+        strict_greater = tau_hat > threshold
+        selected[strict_greater] = 1
+
+        # Calculate how many more elements equal to threshold need to be selected
+        remaining_spots = target_count - np.sum(strict_greater)
+
+        if remaining_spots > 0:
+            # Find all positions equal to threshold and greater than 0
+            equal_threshold_and_positive = (tau_hat == threshold) & (tau_hat > 0)
+            equal_indices = np.where(equal_threshold_and_positive)[0]
+
+            if len(equal_indices) > 0:
+                # Randomly select remaining_spots positions
+                if remaining_spots >= len(equal_indices):
+                    selected[equal_indices] = 1
+                else:
+                    chosen_indices = np.random.choice(equal_indices, remaining_spots, replace=False)
+                    selected[chosen_indices] = 1
+
+        # Ensure only positive values can be selected
+        selected = selected & (tau_hat > 0)
+
+        return selected
+
+    pi_Y_hat = select_top_lambda(tau_Y_hat, lambda_val)
+    pi_S_hat = select_top_lambda(tau_S_hat, lambda_val)
+
+    return pi_Y_hat, pi_S_hat
+
+# Compute R_n
+def compute_R_n(pi_Y_hat, pi_S_hat, A, e_hat, Y, mu_A_hat, tau_Y_hat):
+    e_hat = np.clip(e_hat, 0.1, 0.9)
+
+    ipw_weights = A / e_hat - (1 - A) / (1 - e_hat)
+    q99 = np.percentile(np.abs(ipw_weights), 99)
+    ipw_weights = np.sign(ipw_weights) * np.minimum(np.abs(ipw_weights), q99)
+
+    residuals = Y - mu_A_hat
+    decision_diff = pi_Y_hat - pi_S_hat
+
+    part1 = decision_diff * ipw_weights * residuals
+    part2 = tau_Y_hat * decision_diff
+
+    individual_values = part1 + part2
+    R_n = np.mean(individual_values)
+    print(np.mean(part1), np.mean(part2))
+
+    return R_n, individual_values
+
+def compute_V_n(pi_S_hat, A, e_hat, Y, mu_A_hat, tau_Y_hat, lambda_val):
+    e_hat = np.clip(e_hat, 0.1, 0.9)
+
+    ipw_weights = A / e_hat - (1 - A) / (1 - e_hat)
+    q99 = np.percentile(np.abs(ipw_weights), 99)
+    ipw_weights = np.sign(ipw_weights) * np.minimum(np.abs(ipw_weights), q99)
+
+    residuals = Y - mu_A_hat
+    decision_diff = pi_S_hat - lambda_val
+
+    part1 = decision_diff * ipw_weights * residuals
+    part2 = tau_Y_hat * decision_diff
+
+    individual_values = part1 + part2
+    V_n = np.mean(individual_values)
+    print(np.mean(part1), np.mean(part2))
+
+    return V_n, individual_values
+
+def compute_G_n(pi_S_hat, A, e_hat, Y, mu_0_hat, mu_A_hat, tau_Y_hat, lambda_param):
+    e_hat = np.clip(e_hat, 0.1, 0.9)
+
+    ipw_weights = A / e_hat - (1 - A) / (1 - e_hat)
+    q99 = np.percentile(np.abs(ipw_weights), 99)
+    ipw_weights = np.sign(ipw_weights) * np.minimum(np.abs(ipw_weights), q99)
+
+    residuals = Y - mu_A_hat
+    decision_diff = pi_S_hat
+
+    part1 = decision_diff * ipw_weights * residuals
+    part2 = tau_Y_hat * decision_diff
+    part3 = (1 - A) / (1 - e_hat) * (Y - mu_0_hat) + mu_0_hat
+
+    individual_values = part1 + part2
+    G_n = np.mean(individual_values)
+    print(np.mean(part1), np.mean(part2))
+
+    return G_n, individual_values
+
+
+def asymptotic_confidence_interval(individual_values, alpha=0.05):
+    """Estimate the confidence interval of R_n using asymptotic normality"""
+    n_samples = len(individual_values)
+
+    R_n = np.mean(individual_values)
+    influence_variance = np.var(individual_values, ddof=1)
+    asymptotic_se = np.sqrt(influence_variance / n_samples)
+
+    z_alpha = stats.norm.ppf(1 - alpha / 2)
+    ci_lower = R_n - z_alpha * asymptotic_se
+    ci_upper = R_n + z_alpha * asymptotic_se
+
+    return {
+        'R_n': R_n,
+        'asymptotic_se': asymptotic_se,
+        'confidence_interval': (ci_lower, ci_upper)
+    }
+
+
+def process_real_data(X, A, S, Y, sample_fraction=0.01, alpha=0.05, load_saved_models=False):
+    """Process real data and compute Rn and confidence intervals"""
+
+    # If loading saved models
+    if load_saved_models and os.path.exists(MODEL_DIR):
+        print("Loading saved models...")
+        try:
+            propensity_model, mu_1_model, mu_0_model, tau_Y_model, tau_S_model, test_data = load_models()
+            X_test = test_data['X_test']
+            A_test = test_data['A_test']
+            Y_test = test_data['Y_test']
+            S_test = test_data['S_test']
+            print(f"Test set size: {len(X_test)}")
+        except:
+            print("Failed to load models, retraining...")
+            load_saved_models = False
+
+    # If not loading models or loading fails, retrain
+    if not load_saved_models:
+        n_total = len(X)
+        n_sample = int(n_total * sample_fraction)
+
+        print(f"Randomly sample {n_sample} records from {n_total} records ({sample_fraction * 100}%)")
+
+        indices = np.random.choice(n_total, size=n_sample, replace=False)
+        X_sampled = X[indices]
+        A_sampled = A[indices]
+        S_sampled = S[indices]
+        Y_sampled = Y[indices]
+
+        X_train, X_test, A_train, A_test, Y_train, Y_test, S_train, S_test = train_test_split(
+            X_sampled, A_sampled, Y_sampled, S_sampled, test_size=0.3, random_state=42)
+
+        print(f"Train set size: {len(X_train)}, Test set size: {len(X_test)}")
+
+        # Fit models
+        propensity_model = estimate_propensity_score(X_train, A_train)
+        mu_1_model, mu_0_model = estimate_conditional_expectation(X_train, A_train, Y_train)
+        tau_Y_model, _ = estimate_tau_Y(X_train, A_train, Y_train)
+        tau_S_model, _ = estimate_tau_S(X_train, A_train, S_train)
+
+        # Save models
+        save_models(propensity_model, mu_1_model, mu_0_model, tau_Y_model, tau_S_model,
+                    X_test, A_test, Y_test, S_test)
+
+    # Predict on test set
+    e_hat_test = propensity_model.predict_proba(X_test)[:, 1]
+    e_hat_test = np.clip(e_hat_test, 0.1, 0.9)
+
+    mu_1_hat_test = mu_1_model.predict(X_test)
+    mu_0_hat_test = mu_0_model.predict(X_test)
+    mu_A_hat_test = A_test * mu_1_hat_test + (1 - A_test) * mu_0_hat_test
+
+    X_test_with_A_1 = np.column_stack((X_test, np.ones(len(X_test))))
+    X_test_with_A_0 = np.column_stack((X_test, np.zeros(len(X_test))))
+
+    tau_Y_hat_test = tau_Y_model.predict(X_test_with_A_1) - tau_Y_model.predict(X_test_with_A_0)
+    tau_S_hat_test = tau_S_model.predict(X_test_with_A_1) - tau_S_model.predict(X_test_with_A_0)
+
+    pi_Y_hat_test, pi_S_hat_test = estimate_decision_rules(tau_Y_hat_test, tau_S_hat_test, lambda_val)
+
+    R_n, individual_values = compute_R_n(
+        pi_Y_hat_test, pi_S_hat_test, A_test, e_hat_test, Y_test, mu_A_hat_test, tau_Y_hat_test
+    )
+
+    V_n, individual_values_ = compute_V_n(
+        pi_S_hat_test, A_test, e_hat_test, Y_test, mu_A_hat_test, tau_Y_hat_test, lambda_val=lambda_val
+    )
+
+    G_n, individual_values__ = compute_G_n(
+        pi_S_hat_test, A_test, e_hat_test, Y_test, mu_0_hat_test, mu_A_hat_test, tau_Y_hat_test, lambda_param=lambda_val
+    )
+
+    print(np.mean(pi_Y_hat_test), np.mean(pi_S_hat_test))
+
+    results = asymptotic_confidence_interval(individual_values, alpha=alpha)
+    results_v = asymptotic_confidence_interval(individual_values_, alpha=alpha)
+    results_g = asymptotic_confidence_interval(individual_values__, alpha=alpha)
+
+    print(f"R_n: {results['R_n']:.6f}")
+    print(f"Standard deviation: {results['asymptotic_se']:.6f}")
+    print(f"95% Confidence Interval: [{results['confidence_interval'][0]:.6f}, {results['confidence_interval'][1]:.6f}]")
+
+    print(f"V_n: {results_v['R_n']:.6f}")
+    print(f"Standard deviation: {results_v['asymptotic_se']:.6f}")
+    print(f"95% Confidence Interval: [{results_v['confidence_interval'][0]:.6f}, {results_v['confidence_interval'][1]:.6f}]")
+
+    print(f"G_n: {results_g['R_n']:.6f}")
+    print(f"Standard deviation: {results_g['asymptotic_se']:.6f}")
+    print(f"95% Confidence Interval: [{results_g['confidence_interval'][0]:.6f}, {results_g['confidence_interval'][1]:.6f}]")
+
+    return results
+
+
+def main():
+    random.seed(42)
+    df = pd.read_csv("F:/pythonProject/surrogate/criteo-uplift-v2.1.csv")
+    A = df['treatment'].values
+    S = df['visit'].values
+    Y = df['conversion'].values
+    feature_cols = [f'f{i}' for i in range(12)]
+    X = df[feature_cols].values
+
+    results = process_real_data(X, A, S, Y, sample_fraction=0.3, alpha=0.05, load_saved_models=False)
+
+
+if __name__ == "__main__":
+    main()
